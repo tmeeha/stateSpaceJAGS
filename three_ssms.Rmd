@@ -1,0 +1,483 @@
+---
+title: "Three State Space Models Applied to One Time Series of Monarch Butterfly Abundance"
+author: "Tim Meehan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: united
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, error=FALSE, warning=FALSE, 
+                      fig.align = "center", cache=TRUE)
+```
+
+## Background
+
+State space models (SSMs) are widely used in ecology. One common use is for 
+modeling time series of population abundances. An advantage of using SSMs 
+over other types of models is that they allow parsing the variation in the data 
+into an observation portion and a process portion. The ability to parse out these 
+two types of variation is useful in population studies because it allows for 
+forecasts that ignore observation noise while incorporating biologically 
+important process variation.
+
+State space models can be specified and estimated in many ways. Here I 
+demonstrate how to specify and estimate three commonly used SSMs in a Bayesian 
+context using JAGS MCMC software interfaced with R statistical computing 
+software. The three models used in the demonstration 
+include a density independent Stochastic 
+Level (SL) SSM, a density independent Stochastic Level with Drift (SD) SSM, and a 
+density dependent Stochastic Gompertz (SG) SSM. For all three examples, 
+the natural log of abundance, log(abundance) = $y_t$, is used as the response
+and error of log transformed aboundance is assumed to be normally distributed, 
+which is common practice in the population
+ecology literature. All models assume that an observation at a given time, 
+$y_t$, is an imperfect reflection of a true state, $x_t$. The noisy observation 
+component for all three models is:
+
+$$y_t = x_t + \epsilon_t \quad\text{with}\quad \epsilon_t \sim N(0, \sigma^2_y),$$ 
+where the observation at time $t$ depends on the true state at that time plus 
+random observation error. The state component for the SL SSM is: 
+$$x_t = x_{t-1} + \eta_t \quad\text{with}\quad \eta_t \sim N(0, \sigma^2_x),$$ 
+where the state at time $t$ depends on the state during the previous time step plus
+random process variation. The state component for the SD SSM is: 
+$$x_t = x_{t-1} + \beta_0 + \eta_t \quad\text{with}\quad \eta_t \sim N(0, \sigma^2_x),$$ 
+which is the same as the SL SSM except for the added assumption of average 
+growth or drift, represented by $\beta_0$. The state component for the SG SSM is: 
+$$x_t = x_{t-1} + \beta_0 + \beta_1(x_{t-1}) + \eta_t \quad\text{with}\quad \eta_t \sim N(0, \sigma^2_x),$$ 
+which is similar to the SD SSM except that $\beta_0$ is no longer a constant 
+growth rate, but is analogous to a maximum growth rate that is modified by a 
+density dependent growth rate penalty $\beta_1(x_{t-1})$.
+
+The time series data used for this demonstration were gathered from the literature 
+and comprise 29 years of total annual 
+abundance estimates of monarch butterflies wintering in Mexico and along the West 
+Coast of the USA. Each of the three SSMs is fitted to the monarch data, models are 
+compared using information criteria, and 20-year forecasts are produced from each
+model and compared to five hypothetical quasi-extinction thresholds. 
+
+## Data
+
+The demonstration starts by loading a bunch of R libraries and entering data 
+gathered from the literature. The data are from two populations. They
+are combined here into one global population of migratory monarchs, for simplicity. 
+There is a small bit of data tweaking to account for the fact that the much smaller 
+Western population was not monitored from 1993 through 1996.
+
+```{r dat}
+# set up
+library(kableExtra)
+library(cowplot)
+library(ggplot2)
+library(arm)
+library(loo)
+library(MCMCvis)
+library(R2jags)
+library(dplyr)
+setwd(getwd())
+
+# write data
+md0 <- data.frame(
+  pop="Eastern migrants",
+  year = 1993:2021,
+  index = c(6.23, 7.81,12.61,18.19,5.77,5.56,8.97,2.83,9.36,7.54,11.12,
+            2.19,5.91,6.87,4.61,5.06,1.92,4.02,2.89,1.19,0.67,1.13,4.01,
+            2.91,2.48,6.05, 2.83, 2.10, 2.84)
+) %>% 
+  mutate(index=round(index * 21100000,0)) %>% 
+  bind_rows(data.frame(
+    pop="Western migrants",
+    year = 1997:2021,
+    index = c(1235490,564349,267574,390057,209570,99353,254378,205085,	
+              218679,221058,86437,131889,58468,143204,222525,144812,	
+              211275,234731,292888,298464,192624,27721,29436,1899,	
+              247246)))
+
+# sum across regional populations
+md1 <- md0 %>%  
+  group_by(year) %>% 
+  summarise(sites=n(),
+            west_prop=min(index) / max(index),
+            index=sum(index, na.rm=F))
+
+# correct first four years using mean proportion from west
+cf <- md1 %>% filter(west_prop!=1) %>% pull(west_prop) %>% mean() + 1
+md1$index[md1$west_prop==1] <- md1$index[md1$west_prop==1] * cf
+md1 <- md1 %>% dplyr::select(year, index) %>% 
+  mutate(yr=year-min(year)+1, log_idx=log(index))
+```
+
+## Stochastic level model
+
+The first model, the SL SSM, is written out in JAGS syntax as follows. Note that 
+the model statement includes prior specification, the model likelihood, and a 
+derived parameter. Parsing out the two different types of variation in the data
+is both a benefit and a challenge of SSMs. It is common to make the job easier 
+by setting an informed prior on the observation error when information is available. 
+Luckily, this particular time series has been analyzed 1.3 gazillion times in the literature, 
+so we can use previous observation error estimates to inform the prior. The derived
+parameter in the model statement is a point-wise log likelihood used for model 
+evaluation. The value is not computed for the first time point because
+the initial state value is a guess. It is also not computed for 20 NA values added 
+to the data for forecasting purposes. After writing out the model, I bundle the 
+data for JAGS, specify some MCMC settings, and estimate the model. For more 
+reproducible model results, increase ni, nt, and nb by a factor of 100 and wait 
+an extra 40 minutes.
+
+```{r m1, results="hide"}
+# write model
+cat(file = "ssm_mod.txt", "
+model {
+### priors
+  mu[1] ~ dnorm(y[1], ((0.67-0.21)/1.97)^-2)
+  tau.obs <- 1 / (sigma.obs * sigma.obs)
+  sigma.obs ~ dnorm(0.44, ((0.67-0.21)/1.97)^-2)
+  tau.proc <- 1 / (sigma.proc * sigma.proc)
+  sigma.proc ~ dunif(0, 100)
+### likelihood
+  for (i in 2:n){
+    y[i] ~ dnorm(mu[i], tau.obs)
+    mu[i] ~ dnorm(mu[i - 1], tau.proc)
+  }
+### derived
+  for(i in 2:29){
+    loglik[i] <- logdensity.norm(y[i], mu[i], tau.obs)
+  }
+}
+")
+
+# data
+y <- c(md1$log_idx, rep(NA, 20))
+n <- length(y)
+dat_ssm1 <- list(y = y, n = n); parameters <- c("loglik","mu","b0","b1","sigma.proc")
+
+# mcmc settings
+ni <- 150000; nt <- 10; nb <- 50000; nc <- 2; nad <- 10000
+
+# call jags
+stoch_out <- jags(dat_ssm1, inits=NULL, parameters, "ssm_mod.txt", 
+                 n.chains=nc, n.thin=nt, n.iter=ni, n.burnin=nb)
+```
+
+After running the model, I extract point-wise log likelihoods, produce 
+the leave-one-out cross-validation information criterion (LOOIC) value for the model,
+and plot the data, model fit, and forecast.
+
+```{r m1b}
+# get logliks
+stoch_ll <- stoch_out$BUGSoutput$sims.list$loglik
+stoch_ref <- relative_eff(exp(stoch_ll), chain_id = rep(1:2, each = 10000))
+
+# get looic
+stoch_looic <- round(loo(stoch_ll, r_eff=stoch_ref)$estimates['looic','Estimate'], 2)
+
+# compute fitted values
+stoch_mus <- as.data.frame(MCMCsummary(stoch_out, "mu", 
+                                      probs=c(0.025, 0.05, 0.20, 0.5, 0.80, 
+                                              0.95, 0.975))[3:9]) %>% 
+  rename_with(~ paste0("stoch", gsub("%", "", .))) %>% 
+  mutate(year=1993:2041, log_idx=y)
+
+# make ts plot
+stoch_ts <- ggplot(stoch_mus, aes(x=year))  + 
+  geom_ribbon(aes(ymin=stoch2.5, ymax=stoch97.5), alpha=0.2, fill="gray30") +
+  geom_ribbon(aes(ymin=stoch5, ymax=stoch95), alpha=0.3, fill="gray30") +
+  geom_ribbon(aes(ymin=stoch20, ymax=stoch80), alpha=0.4, fill="gray30") +
+  geom_line(aes(y=stoch50), linewidth=0.8, col="gray10") + 
+  geom_point(aes(y=log_idx), pch=16) +
+  labs(x="Year", y="Stochastic model log(abundance)") +
+  scale_y_continuous(limits=c()) +
+  scale_x_continuous(breaks=seq(1995, 2040, 5)) +
+  geom_hline(yintercept=log(200000), lty=2, col="gray10") +
+  geom_hline(yintercept=log(1000000), lty=2, col="gray30") +
+  geom_hline(yintercept=log(3000000), lty=2, col="gray50") +
+  geom_hline(yintercept=log(5000000), lty=2, col="gray60") +
+  geom_hline(yintercept=log(12800000), lty=2, col="gray60") +
+  theme_bw()
+stoch_ts
+```
+
+The plot shows $y_t$ as points and estimated $x_t$ as a solid line and gray ribbons.
+The solid line is the posterior median estimate of $x_t$ while the gray ribbons,
+from light to dark, show 95%, 90%, and 60% credible intervals, respectively. The
+horizontal lines highlight quasi-extinction abundances of 200,000 (bottom), 1 million, 
+3 million, 5 million, and 12.8 million (top).
+
+The SL SSM does not have a drift or trend term in the state component, so the 
+predicted state is a continuation of the state estimated at the time when 
+observations ended. The uncertainty around predicted state values grows with time 
+according to the estimated process variation, $\sigma^2_x$. It is possible to glean 
+information
+about quasi-extinction probabilities from the plot, but we will save that discussion
+for later after we determine the best model for the data.
+
+## Stochastic drift model
+
+Next, I write the SD SSM model in JAGS syntax, estimate the model, compute LOOIC,
+and plot the data, model fit, and forecast. 
+```{r m2, results="hide"}
+cat(file = "ssm_mod.txt", "
+model {
+### priors
+  mu[1] ~ dnorm(y[1], ((0.67-0.21)/1.97)^-2)
+  b0 ~ dnorm(0, 0.001)
+  tau.obs <- 1 / (sigma.obs * sigma.obs)
+  sigma.obs ~ dnorm(0.44, ((0.67-0.21)/1.97)^-2)
+  tau.proc <- 1 / (sigma.proc * sigma.proc)
+  sigma.proc ~ dunif(0, 100)
+### likelihood
+  for (i in 2:n){
+    y[i] ~ dnorm(mu[i], tau.obs)
+    mu[i] ~ dnorm(mu[i - 1] + b0, tau.proc)
+  }
+### derived
+  for(i in 2:29){
+    loglik[i] <- logdensity.norm(y[i], mu[i], tau.obs)
+  }
+}
+")
+
+# call jags
+drift_out <- jags(dat_ssm1, inits=NULL, parameters, "ssm_mod.txt", 
+                 n.chains=nc, n.thin=nt, n.iter=ni, n.burnin=nb)
+
+# get logliks
+drift_ll <- drift_out$BUGSoutput$sims.list$loglik
+drift_ref <- relative_eff(exp(drift_ll), chain_id = rep(1:2, each = 10000))
+
+# get looic
+drift_looic <- round(loo(drift_ll, r_eff=drift_ref)$estimates['looic','Estimate'], 2)
+
+# compute fitted values
+drift_mus <- as.data.frame(MCMCsummary(drift_out, "mu", 
+                                      probs=c(0.025, 0.05, 0.20, 0.5, 0.80, 
+                                              0.95, 0.975))[3:9]) %>% 
+  rename_with(~ paste0("drift", gsub("%", "", .))) %>% 
+  mutate(year=1993:2041, log_idx=y)
+
+# make ts plot
+drift_ts <- ggplot(drift_mus, aes(x=year))  + 
+  geom_ribbon(aes(ymin=drift2.5, ymax=drift97.5), alpha=0.2, fill="gray30") +
+  geom_ribbon(aes(ymin=drift5, ymax=drift95), alpha=0.3, fill="gray30") +
+  geom_ribbon(aes(ymin=drift20, ymax=drift80), alpha=0.4, fill="gray30") +
+  geom_line(aes(y=drift50), linewidth=0.8, col="gray10") + 
+  geom_point(aes(y=log_idx), pch=16) +
+  labs(x="Year", y="Drift model log(abundance)") +
+  scale_y_continuous(limits=c()) +
+  scale_x_continuous(breaks=seq(1995, 2040, 5)) +
+  geom_hline(yintercept=log(200000), lty=2, col="gray10") +
+  geom_hline(yintercept=log(1000000), lty=2, col="gray30") +
+  geom_hline(yintercept=log(3000000), lty=2, col="gray50") +
+  geom_hline(yintercept=log(5000000), lty=2, col="gray60") +
+  geom_hline(yintercept=log(12800000), lty=2, col="gray60") +
+  theme_bw()
+drift_ts
+```
+
+The SD SSM has a constant drift or trend term, $\beta_0$, in the state component. 
+The estimated value for $\beta_0$ is -0.036. Given a constant trend, the SD SSM 
+predicts that abundance will continue to decline, regardless of recent patterns 
+of population growth. Uncertainty around predicted state values grows with 
+time due to process variation, $\sigma^2_x$, and uncertainty in $\beta_0$, which 
+is large as $\beta_0$ has 95% credible limits of -0.185 and 0.120.
+
+## Stochastic Gompertz model
+
+Finally, I write the SG SSM model in JAGS syntax, estimate the model, compute LOOIC,
+and plot the data, model fit, and forecast. 
+
+```{r m3, results="hide"}
+cat(file = "ssm_mod.txt", "
+model {
+### priors
+  mu[1] ~ dnorm(y[1], ((0.67-0.21)/1.97)^-2)
+  b0 ~ dnorm(0, 0.001)
+  b1 ~ dnorm(0, 0.001)
+  tau.obs <- 1 / (sigma.obs * sigma.obs)
+  sigma.obs ~ dnorm(0.44, ((0.67-0.21)/1.97)^-2)
+  tau.proc <- 1 / (sigma.proc * sigma.proc)
+  sigma.proc ~ dunif(0, 100)
+### likelihood
+  for (i in 2:n){
+    y[i] ~ dnorm(mu[i], tau.obs)
+    mu[i] ~ dnorm(mu[i - 1] + b0 + (b1 * mu[i - 1]), tau.proc)
+  }
+### derived
+  for(i in 2:29){
+    loglik[i] <- logdensity.norm(y[i], mu[i], tau.obs)
+  }
+}
+")
+
+# call jags
+gomp_out <- jags(dat_ssm1, inits=NULL, parameters, "ssm_mod.txt", 
+                 n.chains=nc, n.thin=nt, n.iter=ni, n.burnin=nb)
+
+# get logliks
+gomp_ll <- gomp_out$BUGSoutput$sims.list$loglik
+gomp_ref <- relative_eff(exp(gomp_ll), chain_id = rep(1:2, each = 10000))
+
+# get looic
+gomp_looic <- round(loo(gomp_ll, r_eff=gomp_ref)$estimates['looic','Estimate'], 2)
+
+# compute fitted values
+gomp_mus <- as.data.frame(MCMCsummary(gomp_out, "mu", 
+                                      probs=c(0.025, 0.05, 0.20, 0.5, 0.80, 
+                                              0.95, 0.975))[3:9]) %>% 
+  rename_with(~ paste0("gomp", gsub("%", "", .))) %>% 
+  mutate(year=1993:2041, log_idx=y)
+
+# make ts plot
+gomp_ts <- ggplot(gomp_mus, aes(x=year))  + 
+  geom_ribbon(aes(ymin=gomp2.5, ymax=gomp97.5), alpha=0.2, fill="gray30") +
+  geom_ribbon(aes(ymin=gomp5, ymax=gomp95), alpha=0.3, fill="gray30") +
+  geom_ribbon(aes(ymin=gomp20, ymax=gomp80), alpha=0.4, fill="gray30") +
+  geom_line(aes(y=gomp50), linewidth=0.8, col="gray10") + 
+  geom_point(aes(y=log_idx), pch=16) +
+  labs(x="Year", y="Gompertz model log(abundance)") +
+  scale_y_continuous(limits=c()) +
+  scale_x_continuous(breaks=seq(1995, 2040, 5)) +
+  geom_hline(yintercept=log(200000), lty=2, col="gray10") +
+  geom_hline(yintercept=log(1000000), lty=2, col="gray30") +
+  geom_hline(yintercept=log(3000000), lty=2, col="gray50") +
+  geom_hline(yintercept=log(5000000), lty=2, col="gray60") +
+  geom_hline(yintercept=log(12800000), lty=2, col="gray60") +
+  theme_bw()
+gomp_ts
+```
+
+Like the SD SSM, the SG SSM also has growth explicitly included in the model. 
+However, net growth in the SG SSM is not based on a single long term average, 
+but rather depends on two terms, with one considering the previous state. In this
+way, the SG SSM has a mechanism for allowing growth rates to vary over time.
+The parameter estimate for $\beta_1$ from the SG SSM is approximately -0.31, 
+suggesting negative density dependent growth. Forecasted values from the SG SSM level 
+off at a population size of approximately exp(18.14) or 76 million monarchs,
+very close to the hypothetical stationary value of
+$exp(\beta_0 \div (1 - (\beta_1 + 1)))$ or roughly 80 million monarchs. 
+Uncertainty around forecasted state values grows with time due to process 
+variation, $\sigma^2_x$, and uncertainty in $\beta_0$ and $\beta_1$. Interestingly, 
+uncertainty in future states appears less than that from the other two models.
+Why might this be?
+
+## Compare models
+
+Next, I pull together the LOOIC values from each model to compare predicted performance 
+versus parsimony. Additionally, I use the point-wise likelihoods to compute model
+weights for each model.
+
+```{r comp}
+stack_wts <- loo_model_weights(x=list(gomp_mod=gomp_ll, drift_mod=drift_ll, 
+                                      stoch_mod=stoch_ll),
+                               r_eff_list=list(gomp_ref, drift_ref, stoch_ref),
+                               method = "stacking")
+
+bma_wts <- loo_model_weights(x=list(gomp_mod=gomp_ll, drift_mod=drift_ll, 
+                                      stoch_mod=stoch_ll),
+                               r_eff_list=list(gomp_ref, drift_ref, stoch_ref),
+                               method = "pseudobma")
+
+comp_tab <- data.frame(looic=c(gomp_looic, drift_looic, stoch_looic),
+           stack_wts=round(c(stack_wts),2),
+           bma_wts=round(c(bma_wts),2)) %>% arrange(looic)
+
+kbl(comp_tab) %>% kable_styling()
+```
+
+It is pretty clear from the LOOIC values and model weights that the SG SSM is the 
+most appropriate of these three models for these data. The high model weights 
+for the SG SSM suggest that density dependence is an important factor affecting 
+annual abundance changes. The high LOOIC of the SD SSM suggests that models 
+assuming constant density independent growth are not well suited to this time series. 
+
+It is common in the ecological 
+literature to use an SG SSM to explore density dependence in species population
+dynamics. Another simple and intuitive method is to compute raw annual growth 
+rates and plot and regress them against raw abundances during the previous time
+step to look for a relationship. This has been done previously by monarch 
+researchers; I demonstrate how it is done because the results are fairly striking.
+
+```{r dd}
+# calculate raw growth rates at t
+rt <- diff(md1$log_idx)
+
+# get raw abundances at t-1 
+Ntm1 <- md1$log_idx[-29]
+
+# plot growth rate at t versus abundance at t-1
+dd_scatter <- ggplot(data.frame(rt=rt, Ntm1=Ntm1), aes(x=Ntm1, y=rt)) +
+  geom_point() +
+  labs(x="Log(abundance, t-1)", y="Growth rate, t") +
+  geom_smooth(method="lm", col="gray50", se=F) +
+  theme_bw()
+
+# regress growth rate at t versus abundance at t-1
+dd_mod <- lm(rt~Ntm1)
+
+# get and plot the posterior distribution for the slope
+dd_slope <- sim(dd_mod, 10000)@coef[,2]
+dd_hist <- ggplot(data.frame(x=dd_slope), aes(x)) +
+  geom_histogram(col="white") +
+  geom_vline(xintercept=0, lty=2, col="gray50") +
+  labs(y="Posterior samples", x="Density dependence slope value") +
+  theme_bw()
+
+# two plots together
+plot_grid(dd_scatter, dd_hist)
+```
+
+This exercise produces a very clear picture of negative density dependence in 
+monarch population growth rates, and emphasizes that a density dependent 
+Gompertz state space model is the most appropriate of these three models for 
+this time series.
+
+## Model projections
+
+We can use the posterior distribution of forecasted abundance in 2041 from the SG 
+SSM to examine the probability that abundance falls below a variety of 
+quasi-extinction thresholds.
+
+```{r qext}
+# get draws for mu[49] year 2041
+samps_49 <- as.numeric(MCMCchains(gomp_out, "mu[49]", ISB = F))
+
+# get exceedence probabilities
+p_200k <- sum(samps_49 < log(200000)) / length(samps_49)
+p_1m <- sum(samps_49 < log(1000000)) / length(samps_49)
+p_3m <- sum(samps_49 < log(3000000)) / length(samps_49)
+p_5m <- sum(samps_49 < log(5000000)) / length(samps_49)
+p_12m <- sum(samps_49 < log(12800000)) / length(samps_49)
+
+# mu 49 histogram
+hist_49 <- ggplot() +
+  geom_histogram(data=data.frame(x=samps_49), aes(x=x), 
+               col="white") +
+  labs(x="Estimated log(monarch abundance) in 2041", y="Posterior samples") +
+  scale_x_continuous(limits=c(12, 23), breaks=seq(5, 30, 1)) +
+  geom_vline(xintercept=log(200000), lty=5, col="gray10") +
+  geom_vline(xintercept=log(1000000), lty=5, col="gray30") +
+  geom_vline(xintercept=log(3000000), lty=5, col="gray50") +
+  geom_vline(xintercept=log(5000000), lty=5, col="gray70") +
+  geom_vline(xintercept=log(12800000), lty=5, col="gray80") +
+  theme_bw()
+hist_49
+```
+
+According to the data and the SG SSM, the probabilities of monarchs falling below
+12.8 million, 5 million, 3 million, 1 million, or 200,000 individuals over the 
+next 20 years are 0.05, 0.02, 0.02, 0.01, and 0.01, respectively. Keep in mind 
+that these extinction predictions depend strongly on model choice. I'll leave it 
+to others to compute probabilities from 
+the other models, as they don't fit the data nearly as well as the SG SSM. 
+Also, keep in mind that extinction predictions
+from this type of count-based population viability assessment are based on implicit 
+assumptions that the factors controlling monarch population abundance are captured 
+by the data and the prediction model, and that there is no net change in the 
+magnitude of those factors over the prediction period. These are strong assumptions 
+in a rapidly changing world.
+
